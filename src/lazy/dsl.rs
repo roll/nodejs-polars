@@ -1171,6 +1171,83 @@ impl JsExpr {
     pub fn dot(&self, other: &JsExpr) -> JsExpr {
         self.inner.clone().dot(other.inner.clone()).into()
     }
+    /// Map each batch of this expression's values through a JS function.
+    ///
+    /// The function runs on the JS thread while polars waits for its result, so the query
+    /// must be collected asynchronously: a synchronous collect blocks that thread and hangs.
+    #[napi(catch_unwind)]
+    pub fn map_batches(
+        &self,
+        #[napi(ts_arg_type = "(series: JsSeries) => JsSeries")] callback: Function<
+            '_,
+            JsSeries,
+            Unknown<'static>,
+        >,
+        output_type: Option<Wrap<DataType>>,
+        is_elementwise: bool,
+    ) -> JsResult<JsExpr> {
+        let tsfn = std::sync::Arc::new(
+            callback
+                .build_threadsafe_function()
+                .callee_handled::<false>()
+                .weak::<true>()
+                .build()?,
+        );
+        let output_dtype = output_type.map(|dt| dt.0);
+
+        let function = move |columns: &mut [Column]| -> PolarsResult<Column> {
+            let series = std::mem::take(&mut columns[0]).take_materialized_series();
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<std::result::Result<Series, String>>(1);
+            let status = tsfn.call_with_return_value(
+                JsSeries::new(series),
+                napi::threadsafe_function::ThreadsafeFunctionCallMode::Blocking,
+                move |result: JsResult<Unknown<'static>>, env: Env| {
+                    let series = result.and_then(|value| {
+                        // A plain `&JsSeries` may only come from generated argument conversion
+                        let js_series = unsafe {
+                            ClassInstance::<JsSeries>::from_napi_value(env.raw(), value.raw())?
+                        };
+                        Ok(js_series.series.clone())
+                    });
+                    let _ = sender.send(series.map_err(|err| err.reason.clone()));
+                    Ok(())
+                },
+            );
+            if status != napi::Status::Ok {
+                polars_bail!(ComputeError: "mapBatches could not call its function: {status}");
+            }
+            let series = receiver
+                .recv()
+                .map_err(
+                    |_| polars_err!(ComputeError: "mapBatches got no result from its function"),
+                )?
+                .map_err(
+                    |reason| polars_err!(ComputeError: "mapBatches function failed: {reason}"),
+                )?;
+            Ok(series.into_column())
+        };
+        let output = move |_: &Schema, fields: &[Field]| {
+            let dtype = output_dtype
+                .clone()
+                .unwrap_or_else(|| fields[0].dtype().clone());
+            Ok(Field::new(fields[0].name().clone(), dtype))
+        };
+        let options = if is_elementwise {
+            polars_plan::prelude::FunctionOptions::elementwise()
+        } else {
+            polars_plan::prelude::FunctionOptions::groupwise()
+        };
+
+        Ok(Expr::AnonymousFunction {
+            input: vec![self.inner.clone()],
+            function: dsl::new_column_udf(dsl::BaseColumnUdf::new(function, output)),
+            options,
+            fmt_str: Box::new(PlSmallStr::from_static("map_batches")),
+        }
+        .into())
+    }
+
     #[napi(catch_unwind)]
     pub fn hash(&self, k0: Wrap<u64>, k1: Wrap<u64>, k2: Wrap<u64>, k3: Wrap<u64>) -> JsExpr {
         let function = move |s: Column| {

@@ -11,7 +11,7 @@ export type { ExprStruct as StructNamespace } from "./struct";
 import { isRegExp } from "node:util/types";
 import type { DataType } from "../../datatypes";
 import pli from "../../internals/polars_internal";
-import { Series } from "../../series";
+import { _Series, Series } from "../../series";
 import type {
   Arithmetic,
   Comparison,
@@ -606,6 +606,20 @@ export interface Expr
   gather({ index }: { index: Expr | number[] | Series }): Expr;
   /** Take every nth value in the Series and return as a new Series. */
   gatherEvery(n: number, offset?: number): Expr;
+  /**
+   * Map each batch of values through a function that returns a Series of the same length.
+   *
+   * The function runs on the JS thread while polars waits for it, so a query using it must be
+   * collected with `await collect()`; `collectSync()` blocks that thread and never returns.
+   * @param fn - receives a batch as a Series and returns the mapped Series
+   * @param options.returnType - the output dtype; the input's dtype by default
+   * @param options.isElementwise - true when each value maps independently, which lets the
+   * streaming engine call `fn` per batch instead of once on the whole column
+   */
+  mapBatches(
+    fn: (series: Series) => Series,
+    options?: { returnType?: DataType; isElementwise?: boolean },
+  ): Expr;
   /** Hash the Series. */
   hash(k0?: number, k1?: number, k2?: number, k3?: number): Expr;
   hash({
@@ -1860,6 +1874,15 @@ export const _Expr = (_expr: any): Expr => {
     },
     gatherEvery(n, offset = 0) {
       return _Expr(_expr.gatherEvery(n, offset));
+    },
+    mapBatches(fn, { returnType, isElementwise = false } = {}) {
+      return _Expr(
+        _expr.mapBatches(
+          (batch: any) => fn(_Series(batch))._s,
+          returnType,
+          isElementwise,
+        ),
+      );
     },
     hash(obj: any = 0, k1 = 1, k2 = 2, k3 = 3) {
       if (typeof obj === "number" || typeof obj === "bigint") {

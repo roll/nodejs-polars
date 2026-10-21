@@ -2183,3 +2183,56 @@ describe("lazyframe", () => {
     assert.throws(fn, TypeError);
   });
 });
+
+describe("mapBatches", () => {
+  test("maps the column through a function", async () => {
+    const ldf = pl.DataFrame({ a: [1, 2, 3] }).lazy();
+    const actual = await ldf
+      .select(pl.col("a").mapBatches((s) => s.mul(2)))
+      .collect();
+    assertSeriesEqual(actual.getColumn("a"), pl.Series("a", [2, 4, 6]));
+  });
+  test("takes a return type for an elementwise function", async () => {
+    const ldf = pl.DataFrame([pl.Series("a", [1, 2, 3], pl.Int64)]).lazy();
+    const actual = await ldf
+      .select(
+        pl
+          .col("a")
+          .mapBatches((s) => s.cast(pl.Utf8), {
+            returnType: pl.Utf8,
+            isElementwise: true,
+          }),
+      )
+      .collect();
+    assertSeriesEqual(actual.getColumn("a"), pl.Series("a", ["1", "2", "3"]));
+  });
+  test("sees every row once as a side channel of a filtering query", async () => {
+    const rows = 300_000;
+    const ldf = pl
+      .DataFrame({ a: Array.from({ length: rows }, (_, i) => i) })
+      .lazy();
+    const seen: number[] = [];
+    const flag = pl.col("a").mapBatches(
+      (s) => {
+        seen.push(s.len());
+        return pl.Series("a", new Array(s.len()).fill(false), pl.Bool);
+      },
+      { returnType: pl.Bool, isElementwise: true },
+    );
+    const actual = await ldf.filter(pl.col("a").eq(7).or(flag)).collect();
+    assert.strictEqual(actual.height, 1);
+    assert.strictEqual(
+      seen.reduce((sum, n) => sum + n, 0),
+      rows,
+    );
+  });
+  test("rejects the query when the function throws", async () => {
+    const ldf = pl.DataFrame({ a: [1, 2, 3] }).lazy();
+    const query = ldf.select(
+      pl.col("a").mapBatches(() => {
+        throw new Error("boom");
+      }),
+    );
+    await assert.rejects(query.collect(), /boom/);
+  });
+});
